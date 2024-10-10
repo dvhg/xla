@@ -41,16 +41,22 @@ mutation_ops_to_functional = {
   torch.ops.aten.random_: torch.ops.aten.uniform,
   torch.ops.aten.uniform_: torch.ops.aten.uniform,
   torch.ops.aten.relu_: torch.ops.aten.relu,
-  torch.ops.aten.squeeze_: torch.ops.aten.squeeze,
+  # squeeze_ is expected to change tensor's shape. So replace with new value 
+  torch.ops.aten.squeeze_: (torch.ops.aten.squeeze, True),
   torch.ops.aten.clamp_: torch.ops.aten.clamp,
   torch.ops.aten.ceil_: torch.ops.aten.ceil,
   torch.ops.aten.logical_not_: torch.ops.aten.logical_not,
   torch.ops.aten.unsqueeze_: torch.ops.aten.unsqueeze,
   torch.ops.aten.transpose_: torch.ops.aten.transpose,
+  torch.ops.aten.log_normal_: torch.ops.aten.log_normal,
 }
 
 
 def make_mutation(op):
+  if type(mutation_ops_to_functional[op]) is tuple:
+    return op_base.InplaceOp(mutation_ops_to_functional[op][0],
+                             replace=mutation_ops_to_functional[op][1],
+                             position_to_mutate=0)
   return op_base.InplaceOp(mutation_ops_to_functional[op], position_to_mutate=0)
 
 
@@ -103,7 +109,13 @@ def _aten_add(x, y, *, alpha=1):
 
 @op(torch.ops.aten.copy_, is_jax_function=False)
 def _aten_copy(x, y, memory_format=None):
-  x._elem = y._elem.astype(x._elem.dtype)
+  if x.ndim == 1 and y.ndim == 0:
+    # case of torch.empty((1,)).copy_(tensor(N))
+    # we need to return 0D tensor([N]) and not scalar tensor(N)
+    # ref: https://github.com/pytorch/xla/issues/7505#issuecomment-2395319131
+    x._elem = jnp.array([y._elem.astype(x._elem.dtype)])
+  else:
+    x._elem = y._elem.astype(x._elem.dtype)
   return x
 
 
@@ -1290,7 +1302,8 @@ def _aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, dtype=None):
   # Special cases (for efficiency and clarity)
   if ord == 0:
     if self.shape == ():
-      result = jnp.array(float(self != 0))
+      # float sets it to float64. set it back to input type
+      result = jnp.astype(jnp.array(float(self != 0)), self.dtype)
     else:
       result = _with_reduction_scalar(jnp.sum, jnp.where(self != 0, 1, 0), dim, keepdim)
 
@@ -2530,6 +2543,9 @@ def _aten_nextafter(input, other, *, out=None):
 # aten.nonzero
 @op(torch.ops.aten.nonzero)
 def _aten_nonzero(x):
+  if jnp.ndim(x) == 0: # when x is scalar, return torch.tensor([], size=(1, 0), dtype=torch.int64)
+    res = torch.empty(1, 0, dtype=torch.int64)
+    return jnp.array(res.numpy())
   index_tuple = jnp.nonzero(x)
   index_tuple = [jnp.expand_dims(p, -1) for p in index_tuple]
   return jnp.concatenate(index_tuple, axis=-1)
@@ -4214,7 +4230,7 @@ def _aten__linalg_slogdet(input):
 # torch.linalg.svd
 @op(torch.ops.aten._linalg_svd)
 def _aten__linalg_svd(a, full_matrices=True):
-  return jnp.linalg.svd(a, full_matrices)
+  return jnp.linalg.svd(a, full_matrices=full_matrices)
 
 
 # torch.linalg.pinv
@@ -4226,7 +4242,35 @@ def _aten_linalg_pinv_atol_rtol_tensor(a, rtol=None, **kwargs):
 # torch.linalg.solve
 @op(torch.ops.aten._linalg_solve_ex)
 def _aten__linalg_solve_ex(a, b):
-  return jnp.linalg.solve(a, b), jnp.array(0)
+  res = jnp.linalg.solve(a, b)
+  info_shape = a.shape[0] if len(a.shape) >= 3 else []
+  info = jnp.zeros(info_shape, dtype=mappings.t2j_dtype(torch.int32))
+  return res, info
+
+
+# torch.linalg.solve_triangular
+@op(torch.ops.aten.linalg_solve_triangular)
+def _aten_linalg_solve_triangular(a, b, *, upper=True, left=True, unitriangular=False):
+  if left is False:
+    a = jnp.matrix_transpose(a)
+    b = jnp.matrix_transpose(b)
+    upper = not upper
+  res = jax.scipy.linalg.solve_triangular(a, b, lower=not upper, unit_diagonal=unitriangular)
+  if left is False:
+    res = jnp.matrix_transpose(res)
+  return res
+
+
+@op(torch.ops.aten.linalg_inv_ex)
+def _aten_linalg_inv_ex(a):
+  ainv = jnp.linalg.inv(a)
+  info = jnp.array(0)
+  return ainv, info
+
+
+@op(torch.ops.aten._linalg_check_errors)
+def _aten__linalg_check_errors(*args, **kwargs):
+  pass
 
 
 @op(torch.ops.aten.median)
